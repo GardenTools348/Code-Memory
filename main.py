@@ -1,5 +1,7 @@
 import os
 import logging
+import urllib.request
+import urllib.parse
 from contextlib import asynccontextmanager
 
 import anthropic
@@ -12,12 +14,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("swing-trader")
 
 # Config
-BOT_SECRET        = os.environ.get("RAILWAY_BOT_SECRET", "")
-BYBIT_API_KEY     = os.environ.get("BYBIT_API_KEY", "")
-BYBIT_API_SECRET  = os.environ.get("BYBIT_API_SECRET", "")
-BYBIT_DEMO        = os.environ.get("BYBIT_DEMO", "true").lower() == "true"
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ORDER_QTY_USDT    = float(os.environ.get("ORDER_QTY_USDT", "100"))
+BOT_SECRET          = os.environ.get("RAILWAY_BOT_SECRET", "")
+BYBIT_API_KEY       = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_API_SECRET    = os.environ.get("BYBIT_API_SECRET", "")
+BYBIT_DEMO          = os.environ.get("BYBIT_DEMO", "true").lower() == "true"
+ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "")
+ORDER_QTY_USDT      = float(os.environ.get("ORDER_QTY_USDT", "100"))
 STOP_LOSS_PCT     = float(os.environ.get("STOP_LOSS_PCT", "2"))
 TAKE_PROFIT_PCT   = float(os.environ.get("TAKE_PROFIT_PCT", "4"))
 SYMBOL            = os.environ.get("SYMBOL", "BTCUSDT")
@@ -51,6 +55,17 @@ def calc_rsi(closes: list, period: int = 14) -> list:
         rs = avg_gain / avg_loss if avg_loss > 0 else 100
         rsi_vals.append(100 - 100 / (1 + rs))
     return rsi_vals
+
+def send_telegram(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message}).encode()
+        urllib.request.urlopen(url, data=data, timeout=10)
+    except Exception as e:
+        logger.error("Telegram notification failed: %s", e)
+
 
 def find_pivot_lows(lows: list, lb: int = 10) -> list:
     return [lows[i] for i in range(lb, len(lows) - lb)
@@ -148,6 +163,7 @@ async def run_scan():
 
         if not signal["all_conditions_met"]:
             logger.info("Conditions not fully met — no trade.")
+            check_closed_positions()
             return
 
         logger.info("All 5 conditions met — consulting Claude...")
@@ -156,6 +172,8 @@ async def run_scan():
 
         if not response.startswith("buy"):
             logger.info("Claude said hold — no trade.")
+            send_telegram(f"⏸ Swing Trader: All 5 conditions met but Claude said hold.\n\nReason: {response}")
+            check_closed_positions()
             return
 
         price       = signal["price"]
@@ -175,9 +193,17 @@ async def run_scan():
             takeProfit=str(take_profit),
         )
         logger.info("Order placed: %s", result)
+        send_telegram(
+            f"✅ LONG opened on {SYMBOL}\n"
+            f"Price: ${price:,.2f}\n"
+            f"Stop Loss: ${stop_loss:,.2f} (-{STOP_LOSS_PCT}%)\n"
+            f"Take Profit: ${take_profit:,.2f} (+{TAKE_PROFIT_PCT}%)\n"
+            f"Claude: {response}"
+        )
 
     except Exception as e:
         logger.error("Scan error: %s", e)
+        send_telegram(f"⚠️ Swing Trader error: {e}")
 
 
 # --- App startup/shutdown ---
@@ -242,6 +268,23 @@ async def execute(req: ExecuteRequest, request: Request):
     except Exception as exc:
         logger.error("Order failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+_open_positions: dict = {}
+
+def check_closed_positions():
+    try:
+        resp = session.get_positions(category="linear", symbol=SYMBOL)
+        current = {p["side"]: float(p["size"]) for p in resp["result"]["list"] if float(p.get("size", 0)) > 0}
+
+        for side, size in _open_positions.items():
+            if side not in current:
+                send_telegram(f"🔔 {SYMBOL} {side} position closed\nSize was: {size} BTC")
+
+        _open_positions.clear()
+        _open_positions.update(current)
+    except Exception as e:
+        logger.error("Position check error: %s", e)
 
 
 def close_opposing_position(symbol: str, new_side: str) -> dict | None:
