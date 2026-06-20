@@ -276,6 +276,46 @@ def health():
     return {"status": "ok", "demo": BYBIT_DEMO}
 
 
+@app.post("/test-short")
+async def test_short(request: Request):
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {BOT_SECRET}":
+        raise HTTPException(status_code=401, detail="invalid secret")
+
+    resp    = session.get_kline(category="linear", symbol=SYMBOL, interval="D", limit=200)
+    candles = list(reversed(resp["result"]["list"]))
+    closes  = [float(c[4]) for c in candles]
+    highs   = [float(c[2]) for c in candles]
+    lows    = [float(c[3]) for c in candles]
+    vols    = [float(c[5]) for c in candles]
+
+    ema21       = calc_ema(closes, 21)[-1]
+    ma50        = calc_sma(closes, 50)[-1]
+    rsi_series  = calc_rsi(closes, 14)
+    vol_avg     = calc_sma(vols, 20)[-1]
+    resistance  = find_pivot_highs(highs)
+    price       = closes[-1]
+
+    fake_signal = {
+        "price":      price,
+        "ema21":      round(ema21, 2),
+        "ma50":       round(ma50, 2),
+        "rsi":        round(rsi_series[-1], 2),
+        "vol_ratio":  round(vols[-1] / vol_avg, 2),
+        "resistance": round(resistance[-1], 2) if resistance else round(price * 1.02, 2),
+    }
+
+    response = ask_claude("short", fake_signal)
+    logger.info("Test short — Claude: %s", response)
+
+    if response.startswith("sell"):
+        execute_trade("Sell", price)
+        return {"status": "executed", "claude": response, "price": price}
+    else:
+        send_telegram(f"⏸ Test short: Claude said hold.\nReason: {response}")
+        return {"status": "held", "claude": response}
+
+
 @app.post("/execute")
 async def execute(req: ExecuteRequest, request: Request):
     auth = request.headers.get("Authorization", "")
