@@ -3,8 +3,11 @@ import logging
 import urllib.request
 import urllib.parse
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import anthropic
+import psycopg2
+import psycopg2.extras
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -25,9 +28,74 @@ ORDER_QTY_USDT      = float(os.environ.get("ORDER_QTY_USDT", "100"))
 STOP_LOSS_PCT       = float(os.environ.get("STOP_LOSS_PCT", "2"))
 TAKE_PROFIT_PCT     = float(os.environ.get("TAKE_PROFIT_PCT", "4"))
 SYMBOL              = os.environ.get("SYMBOL", "BTCUSDT")
+DATABASE_URL        = os.environ.get("DATABASE_URL", "")
 
 session = HTTP(demo=BYBIT_DEMO, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
 claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+# --- Database ---
+
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
+def init_db():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id            SERIAL PRIMARY KEY,
+                    symbol        VARCHAR(20),
+                    side          VARCHAR(10),
+                    entry_price   FLOAT,
+                    qty           FLOAT,
+                    stop_loss     FLOAT,
+                    take_profit   FLOAT,
+                    entry_time    TIMESTAMP,
+                    exit_price    FLOAT,
+                    exit_time     TIMESTAMP,
+                    exit_reason   VARCHAR(20),
+                    pnl_usdt      FLOAT,
+                    pnl_pct       FLOAT,
+                    claude_reason TEXT
+                )
+            """)
+        conn.commit()
+    logger.info("Database ready.")
+
+def log_trade_entry(side: str, entry_price: float, qty: float,
+                    stop_loss: float, take_profit: float, claude_reason: str) -> int:
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO trades (symbol, side, entry_price, qty, stop_loss, take_profit, entry_time, claude_reason)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+            """, (SYMBOL, side, entry_price, qty, stop_loss, take_profit,
+                  datetime.now(timezone.utc), claude_reason))
+            trade_id = cur.fetchone()[0]
+        conn.commit()
+    return trade_id
+
+def log_trade_exit(symbol: str, side: str, exit_price: float,
+                   exit_reason: str, entry_price: float, qty: float):
+    if side == "Buy":
+        pnl_usdt = (exit_price - entry_price) * qty
+        pnl_pct  = (exit_price - entry_price) / entry_price * 100
+    else:
+        pnl_usdt = (entry_price - exit_price) * qty
+        pnl_pct  = (entry_price - exit_price) / entry_price * 100
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE trades SET exit_price=%s, exit_time=%s, exit_reason=%s,
+                    pnl_usdt=%s, pnl_pct=%s
+                WHERE symbol=%s AND side=%s AND exit_price IS NULL
+                ORDER BY entry_time DESC LIMIT 1
+            """, (exit_price, datetime.now(timezone.utc), exit_reason,
+                  pnl_usdt, pnl_pct, symbol, side))
+        conn.commit()
+    return pnl_usdt, pnl_pct
 
 
 # --- Telegram ---
@@ -179,7 +247,7 @@ Be cautious of short squeezes. Reply with 'sell' or 'hold' followed by a one-sen
     return msg.content[0].text.strip().lower()
 
 
-def execute_trade(side: str, price: float):
+def execute_trade(side: str, price: float, claude_reason: str = ""):
     qty         = round(ORDER_QTY_USDT / price, 3)
     if side == "Buy":
         stop_loss   = round(price * (1 - STOP_LOSS_PCT / 100), 2)
@@ -202,6 +270,9 @@ def execute_trade(side: str, price: float):
         takeProfit=str(take_profit),
     )
     logger.info("Order placed: %s", result)
+
+    log_trade_entry(side, price, qty, stop_loss, take_profit, claude_reason)
+
     send_telegram(
         f"{'✅' if side == 'Buy' else '🔻'} {direction} opened on {SYMBOL}\n"
         f"Price: ${price:,.2f}\n"
@@ -253,6 +324,8 @@ scheduler = AsyncIOScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if DATABASE_URL:
+        init_db()
     scheduler.add_job(run_scan, "interval", hours=2)
     scheduler.add_job(check_closed_positions, "interval", minutes=15)
     scheduler.start()
@@ -275,6 +348,37 @@ class ExecuteRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok", "demo": BYBIT_DEMO}
+
+
+@app.get("/performance")
+def performance():
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE exit_price IS NOT NULL) AS total_trades,
+                    COUNT(*) FILTER (WHERE pnl_usdt > 0)           AS wins,
+                    COUNT(*) FILTER (WHERE pnl_usdt <= 0)          AS losses,
+                    ROUND(AVG(pnl_usdt) FILTER (WHERE exit_price IS NOT NULL)::numeric, 2) AS avg_pnl_usdt,
+                    ROUND(SUM(pnl_usdt) FILTER (WHERE exit_price IS NOT NULL)::numeric, 2) AS total_pnl_usdt,
+                    ROUND(MAX(pnl_usdt)::numeric, 2) AS best_trade,
+                    ROUND(MIN(pnl_usdt)::numeric, 2) AS worst_trade
+                FROM trades
+            """)
+            stats = dict(cur.fetchone())
+            total = stats["total_trades"] or 0
+            wins  = stats["wins"] or 0
+            stats["win_rate"] = f"{round(wins / total * 100, 1)}%" if total > 0 else "N/A"
+
+            cur.execute("""
+                SELECT side, entry_price, exit_price, pnl_usdt, pnl_pct,
+                       exit_reason, entry_time, exit_time
+                FROM trades ORDER BY entry_time DESC LIMIT 20
+            """)
+            stats["recent_trades"] = [dict(r) for r in cur.fetchall()]
+    return stats
 
 
 @app.post("/test-long")
@@ -407,14 +511,34 @@ _open_positions: dict = {}
 def check_closed_positions():
     try:
         resp    = session.get_positions(category="linear", symbol=SYMBOL)
-        current = {p["side"]: float(p["size"]) for p in resp["result"]["list"] if float(p.get("size", 0)) > 0}
+        current = {p["side"]: p for p in resp["result"]["list"] if float(p.get("size", 0)) > 0}
 
-        for side, size in _open_positions.items():
+        for side, pos_data in _open_positions.items():
             if side not in current:
-                send_telegram(f"🔔 {SYMBOL} {side} position closed\nSize was: {size} BTC")
+                # Fetch closed PnL from Bybit
+                entry_price = pos_data.get("entry_price", 0)
+                qty         = pos_data.get("size", 0)
+                try:
+                    pnl_resp   = session.get_closed_pnl(category="linear", symbol=SYMBOL, limit=1)
+                    pnl_record = pnl_resp["result"]["list"][0] if pnl_resp["result"]["list"] else {}
+                    exit_price  = float(pnl_record.get("avgExitPrice", 0))
+                    exit_reason = "take_profit" if float(pnl_record.get("closedPnl", 0)) > 0 else "stop_loss"
+                except Exception:
+                    exit_price  = 0
+                    exit_reason = "unknown"
+
+                pnl_usdt, pnl_pct = log_trade_exit(SYMBOL, side, exit_price, exit_reason, entry_price, qty)
+                emoji = "🟢" if pnl_usdt >= 0 else "🔴"
+                send_telegram(
+                    f"🔔 {SYMBOL} {side} position closed\n"
+                    f"Exit: ${exit_price:,.2f} ({exit_reason.replace('_', ' ')})\n"
+                    f"{emoji} P&L: ${pnl_usdt:+.2f} ({pnl_pct:+.2f}%)"
+                )
 
         _open_positions.clear()
-        _open_positions.update(current)
+        _open_positions.update({side: {"side": side, "entry_price": float(p.get("avgPrice", 0)),
+                                        "size": float(p.get("size", 0))}
+                                 for side, p in current.items()})
     except Exception as e:
         logger.error("Position check error: %s", e)
 
