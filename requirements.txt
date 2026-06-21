@@ -5,4 +5,4 @@ pydantic==2.9.2
 python-dotenv==1.0.1
 anthropic==0.40.0
 apscheduler==3.10.4
-psycopg2-binary==2.9.9
+pg8000==1.31.2

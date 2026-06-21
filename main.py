@@ -6,8 +6,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import anthropic
-import psycopg2
-import psycopg2.extras
+import pg8000
+import pg8000.dbapi
+from urllib.parse import urlparse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -37,7 +38,13 @@ claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # --- Database ---
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL)
+    u = urlparse(DATABASE_URL)
+    return pg8000.dbapi.connect(
+        host=u.hostname, port=u.port or 5432,
+        database=u.path.lstrip("/"),
+        user=u.username, password=u.password,
+        ssl_context=True
+    )
 
 def init_db():
     with get_db() as conn:
@@ -367,7 +374,9 @@ def performance():
                     ROUND(MIN(pnl_usdt)::numeric, 2) AS worst_trade
                 FROM trades
             """)
-            stats = dict(cur.fetchone())
+            row = cur.fetchone()
+            cols = [d[0] for d in cur.description]
+            stats = dict(zip(cols, row))
             total = stats["total_trades"] or 0
             wins  = stats["wins"] or 0
             stats["win_rate"] = f"{round(wins / total * 100, 1)}%" if total > 0 else "N/A"
@@ -377,7 +386,8 @@ def performance():
                        exit_reason, entry_time, exit_time
                 FROM trades ORDER BY entry_time DESC LIMIT 20
             """)
-            stats["recent_trades"] = [dict(r) for r in cur.fetchall()]
+            rcols = [d[0] for d in cur.description]
+            stats["recent_trades"] = [dict(zip(rcols, r)) for r in cur.fetchall()]
     return stats
 
 
