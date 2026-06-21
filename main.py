@@ -254,8 +254,9 @@ scheduler = AsyncIOScheduler()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler.add_job(run_scan, "interval", hours=2)
+    scheduler.add_job(check_closed_positions, "interval", minutes=15)
     scheduler.start()
-    logger.info("Swing Trader started — scanning every 2 hours.")
+    logger.info("Swing Trader started — scanning every 2 hours, position check every 15 minutes.")
     yield
     scheduler.shutdown()
 
