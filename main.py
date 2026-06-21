@@ -36,6 +36,8 @@ claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # --- Database ---
 
+DB_AVAILABLE = False
+
 def get_db():
     import re
     m = re.match(r'postgres(?:ql)?://([^:]+):(.+)@\[?([^\]/:]+)\]?:(\d+)/(.+)', DATABASE_URL)
@@ -50,41 +52,55 @@ def get_db():
     )
 
 def init_db():
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS trades (
-                    id            SERIAL PRIMARY KEY,
-                    symbol        VARCHAR(20),
-                    side          VARCHAR(10),
-                    entry_price   FLOAT,
-                    qty           FLOAT,
-                    stop_loss     FLOAT,
-                    take_profit   FLOAT,
-                    entry_time    TIMESTAMP,
-                    exit_price    FLOAT,
-                    exit_time     TIMESTAMP,
-                    exit_reason   VARCHAR(20),
-                    pnl_usdt      FLOAT,
-                    pnl_pct       FLOAT,
-                    claude_reason TEXT
-                )
-            """)
-        conn.commit()
-    logger.info("Database ready.")
+    global DB_AVAILABLE
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL not set — trade journaling disabled.")
+        return
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS trades (
+                        id            SERIAL PRIMARY KEY,
+                        symbol        VARCHAR(20),
+                        side          VARCHAR(10),
+                        entry_price   FLOAT,
+                        qty           FLOAT,
+                        stop_loss     FLOAT,
+                        take_profit   FLOAT,
+                        entry_time    TIMESTAMP,
+                        exit_price    FLOAT,
+                        exit_time     TIMESTAMP,
+                        exit_reason   VARCHAR(20),
+                        pnl_usdt      FLOAT,
+                        pnl_pct       FLOAT,
+                        claude_reason TEXT
+                    )
+                """)
+            conn.commit()
+        DB_AVAILABLE = True
+        logger.info("Database ready.")
+    except Exception as e:
+        logger.warning("Database unavailable — trade journaling disabled: %s", e)
 
 def log_trade_entry(side: str, entry_price: float, qty: float,
-                    stop_loss: float, take_profit: float, claude_reason: str) -> int:
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO trades (symbol, side, entry_price, qty, stop_loss, take_profit, entry_time, claude_reason)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
-            """, (SYMBOL, side, entry_price, qty, stop_loss, take_profit,
-                  datetime.now(timezone.utc), claude_reason))
-            trade_id = cur.fetchone()[0]
-        conn.commit()
-    return trade_id
+                    stop_loss: float, take_profit: float, claude_reason: str) -> int | None:
+    if not DB_AVAILABLE:
+        return None
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO trades (symbol, side, entry_price, qty, stop_loss, take_profit, entry_time, claude_reason)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+                """, (SYMBOL, side, entry_price, qty, stop_loss, take_profit,
+                      datetime.now(timezone.utc), claude_reason))
+                trade_id = cur.fetchone()[0]
+            conn.commit()
+        return trade_id
+    except Exception as e:
+        logger.error("Failed to log trade entry: %s", e)
+        return None
 
 def log_trade_exit(symbol: str, side: str, exit_price: float,
                    exit_reason: str, entry_price: float, qty: float):
@@ -95,16 +111,21 @@ def log_trade_exit(symbol: str, side: str, exit_price: float,
         pnl_usdt = (entry_price - exit_price) * qty
         pnl_pct  = (entry_price - exit_price) / entry_price * 100
 
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE trades SET exit_price=%s, exit_time=%s, exit_reason=%s,
-                    pnl_usdt=%s, pnl_pct=%s
-                WHERE symbol=%s AND side=%s AND exit_price IS NULL
-                ORDER BY entry_time DESC LIMIT 1
-            """, (exit_price, datetime.now(timezone.utc), exit_reason,
-                  pnl_usdt, pnl_pct, symbol, side))
-        conn.commit()
+    if DB_AVAILABLE:
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE trades SET exit_price=%s, exit_time=%s, exit_reason=%s,
+                            pnl_usdt=%s, pnl_pct=%s
+                        WHERE symbol=%s AND side=%s AND exit_price IS NULL
+                        ORDER BY entry_time DESC LIMIT 1
+                    """, (exit_price, datetime.now(timezone.utc), exit_reason,
+                          pnl_usdt, pnl_pct, symbol, side))
+                conn.commit()
+        except Exception as e:
+            logger.error("Failed to log trade exit: %s", e)
+
     return pnl_usdt, pnl_pct
 
 
@@ -334,8 +355,7 @@ scheduler = AsyncIOScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if DATABASE_URL:
-        init_db()
+    init_db()
     scheduler.add_job(run_scan, "interval", hours=2)
     scheduler.add_job(check_closed_positions, "interval", minutes=15)
     scheduler.start()
@@ -362,35 +382,42 @@ def health():
 
 @app.get("/performance")
 def performance():
-    if not DATABASE_URL:
-        raise HTTPException(status_code=503, detail="Database not configured")
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database not available")
     with get_db() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT
-                    COUNT(*) FILTER (WHERE exit_price IS NOT NULL) AS total_trades,
-                    COUNT(*) FILTER (WHERE pnl_usdt > 0)           AS wins,
-                    COUNT(*) FILTER (WHERE pnl_usdt <= 0)          AS losses,
-                    ROUND(AVG(pnl_usdt) FILTER (WHERE exit_price IS NOT NULL)::numeric, 2) AS avg_pnl_usdt,
-                    ROUND(SUM(pnl_usdt) FILTER (WHERE exit_price IS NOT NULL)::numeric, 2) AS total_pnl_usdt,
-                    ROUND(MAX(pnl_usdt)::numeric, 2) AS best_trade,
-                    ROUND(MIN(pnl_usdt)::numeric, 2) AS worst_trade
+                    COUNT(*) FILTER (WHERE exit_price IS NOT NULL),
+                    COUNT(*) FILTER (WHERE pnl_usdt > 0),
+                    COUNT(*) FILTER (WHERE pnl_usdt <= 0),
+                    ROUND(AVG(pnl_usdt) FILTER (WHERE exit_price IS NOT NULL)::numeric, 2),
+                    ROUND(SUM(pnl_usdt) FILTER (WHERE exit_price IS NOT NULL)::numeric, 2),
+                    ROUND(MAX(pnl_usdt)::numeric, 2),
+                    ROUND(MIN(pnl_usdt)::numeric, 2)
                 FROM trades
             """)
-            row = cur.fetchone()
-            cols = [d[0] for d in cur.description]
-            stats = dict(zip(cols, row))
-            total = stats["total_trades"] or 0
-            wins  = stats["wins"] or 0
-            stats["win_rate"] = f"{round(wins / total * 100, 1)}%" if total > 0 else "N/A"
-
+            row   = cur.fetchone()
+            total = int(row[0] or 0)
+            wins  = int(row[1] or 0)
+            stats = {
+                "total_trades":   total,
+                "wins":           wins,
+                "losses":         int(row[2] or 0),
+                "avg_pnl_usdt":   float(row[3] or 0),
+                "total_pnl_usdt": float(row[4] or 0),
+                "best_trade":     float(row[5] or 0),
+                "worst_trade":    float(row[6] or 0),
+                "win_rate":       f"{round(wins / total * 100, 1)}%" if total > 0 else "N/A",
+            }
             cur.execute("""
                 SELECT side, entry_price, exit_price, pnl_usdt, pnl_pct,
                        exit_reason, entry_time, exit_time
                 FROM trades ORDER BY entry_time DESC LIMIT 20
             """)
-            rcols = [d[0] for d in cur.description]
-            stats["recent_trades"] = [dict(zip(rcols, r)) for r in cur.fetchall()]
+            cols = ["side","entry_price","exit_price","pnl_usdt","pnl_pct",
+                    "exit_reason","entry_time","exit_time"]
+            stats["recent_trades"] = [dict(zip(cols, r)) for r in cur.fetchall()]
     return stats
 
 
