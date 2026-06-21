@@ -38,9 +38,11 @@ claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # --- Database ---
 
 def get_db():
-    u = urlparse(DATABASE_URL)
+    url = DATABASE_URL.replace("postgresql://", "postgres://")
+    u = urlparse(url)
+    host = u.hostname.strip("[]") if u.hostname else ""
     return pg8000.dbapi.connect(
-        host=u.hostname, port=u.port or 5432,
+        host=host, port=u.port or 5432,
         database=u.path.lstrip("/"),
         user=u.username, password=u.password,
         ssl_context=True
