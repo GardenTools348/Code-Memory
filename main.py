@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 import anthropic
 import pg8000
 import pg8000.dbapi
-from urllib.parse import urlparse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -39,12 +38,14 @@ claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 def get_db():
     import re
-    url = re.sub(r'@\[([^\]]+)\]', r'@\1', DATABASE_URL)
-    u = urlparse(url)
+    m = re.match(r'postgres(?:ql)?://([^:]+):(.+)@\[?([^\]/:]+)\]?:(\d+)/(.+)', DATABASE_URL)
+    if not m:
+        raise ValueError("Could not parse DATABASE_URL")
+    user, password, host, port, database = m.groups()
     return pg8000.dbapi.connect(
-        host=u.hostname, port=u.port or 5432,
-        database=u.path.lstrip("/"),
-        user=u.username, password=u.password,
+        host=host, port=int(port),
+        database=database.split("?")[0],
+        user=user, password=password,
         ssl_context=True
     )
 
