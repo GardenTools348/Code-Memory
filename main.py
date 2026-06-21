@@ -181,6 +181,32 @@ def find_pivot_highs(highs: list, lb: int = 10) -> list:
     return [highs[i] for i in range(lb, len(highs) - lb)
             if highs[i] == max(highs[i-lb:i+lb+1])]
 
+def find_tp_levels(entry_price: float, side: str) -> tuple[float, float]:
+    resp    = session.get_kline(category="linear", symbol=SYMBOL, interval="240", limit=200)
+    candles = list(reversed(resp["result"]["list"]))
+    highs   = [float(c[2]) for c in candles]
+    lows    = [float(c[3]) for c in candles]
+    if side == "Buy":
+        pivots = sorted(p for p in find_pivot_highs(highs, lb=5) if p > entry_price)
+        tp1 = round(pivots[0], 2) if len(pivots) > 0 else round(entry_price * 1.03, 2)
+        tp2 = round(pivots[1], 2) if len(pivots) > 1 else round(entry_price * 1.06, 2)
+    else:
+        pivots = sorted((p for p in find_pivot_lows(lows, lb=5) if p < entry_price), reverse=True)
+        tp1 = round(pivots[0], 2) if len(pivots) > 0 else round(entry_price * 0.97, 2)
+        tp2 = round(pivots[1], 2) if len(pivots) > 1 else round(entry_price * 0.94, 2)
+    return tp1, tp2
+
+def check_momentum_exhaustion(side: str) -> bool:
+    resp    = session.get_kline(category="linear", symbol=SYMBOL, interval="240", limit=50)
+    candles = list(reversed(resp["result"]["list"]))
+    closes  = [float(c[4]) for c in candles]
+    vols    = [float(c[5]) for c in candles]
+    rsi     = calc_rsi(closes, 14)
+    vol_ma  = calc_sma(vols, 20)
+    rsi_now   = rsi[-1]
+    vol_ratio = vols[-1] / vol_ma[-1]
+    return (rsi_now > 70 and vol_ratio > 1.5) if side == "Buy" else (rsi_now < 30 and vol_ratio > 1.5)
+
 
 # --- Strategy signal check ---
 
@@ -284,36 +310,78 @@ Be cautious of short squeezes. Reply with 'sell' or 'hold' followed by a one-sen
 
 
 def execute_trade(side: str, price: float, claude_reason: str = ""):
-    qty         = round(ORDER_QTY_USDT / price, 3)
-    if side == "Buy":
-        stop_loss   = round(price * (1 - STOP_LOSS_PCT / 100), 2)
-        take_profit = round(price * (1 + TAKE_PROFIT_PCT / 100), 2)
-        direction   = "LONG"
-    else:
-        stop_loss   = round(price * (1 + STOP_LOSS_PCT / 100), 2)
-        take_profit = round(price * (1 - TAKE_PROFIT_PCT / 100), 2)
-        direction   = "SHORT"
+    MIN_QTY   = 0.001
+    total_qty = round(ORDER_QTY_USDT / price, 3)
+    close_side = "Sell" if side == "Buy" else "Buy"
+    direction  = "LONG" if side == "Buy" else "SHORT"
+    stop_loss  = round(price * (1 - STOP_LOSS_PCT / 100) if side == "Buy"
+                       else price * (1 + STOP_LOSS_PCT / 100), 2)
+
+    tp1_price, tp2_price = find_tp_levels(price, side)
+
+    # Split 30 / 40 / 30 — fall back to single TP if qty too small to split
+    qty_tp1 = round(total_qty * 0.30, 3)
+    qty_tp2 = round(total_qty * 0.40, 3)
+    qty_tp3 = round(total_qty - qty_tp1 - qty_tp2, 3)
+    tiered  = qty_tp1 >= MIN_QTY and qty_tp2 >= MIN_QTY and qty_tp3 >= MIN_QTY
 
     close_opposing_position(SYMBOL, side)
 
+    # Main order with SL only (TPs placed as separate reduce-only orders)
     result = session.place_order(
-        category="linear",
-        symbol=SYMBOL,
-        side=side,
-        orderType="Market",
-        qty=str(qty),
-        stopLoss=str(stop_loss),
-        takeProfit=str(take_profit),
+        category="linear", symbol=SYMBOL, side=side,
+        orderType="Market", qty=str(total_qty),
+        stopLoss=str(stop_loss), slTriggerBy="MarkPrice",
     )
     logger.info("Order placed: %s", result)
 
-    log_trade_entry(side, price, qty, stop_loss, take_profit, claude_reason)
+    tp1_order_id = tp2_order_id = ""
+    if tiered:
+        r1 = session.place_order(
+            category="linear", symbol=SYMBOL, side=close_side,
+            orderType="Limit", qty=str(qty_tp1), price=str(tp1_price),
+            reduceOnly=True, timeInForce="GTC",
+        )
+        tp1_order_id = r1["result"].get("orderId", "")
+        r2 = session.place_order(
+            category="linear", symbol=SYMBOL, side=close_side,
+            orderType="Limit", qty=str(qty_tp2), price=str(tp2_price),
+            reduceOnly=True, timeInForce="GTC",
+        )
+        tp2_order_id = r2["result"].get("orderId", "")
+    else:
+        # Order too small to split — single limit TP at tp2
+        session.place_order(
+            category="linear", symbol=SYMBOL, side=close_side,
+            orderType="Limit", qty=str(total_qty), price=str(tp2_price),
+            reduceOnly=True, timeInForce="GTC",
+        )
 
+    _open_positions[side] = {
+        "side":         side,
+        "entry_price":  price,
+        "original_qty": total_qty,
+        "qty_tp3":      qty_tp3 if tiered else 0,
+        "tp1_price":    tp1_price,
+        "tp2_price":    tp2_price,
+        "stop_loss":    stop_loss,
+        "tp1_order_id": tp1_order_id,
+        "tp2_order_id": tp2_order_id,
+        "tiered":       tiered,
+        "tp1_hit":      False,
+        "tp2_hit":      False,
+        "tp3_hit":      False,
+        "be_moved":     False,
+    }
+
+    log_trade_entry(side, price, total_qty, stop_loss, tp1_price, claude_reason)
+
+    tp_note = (f"TP1 (30%): ${tp1_price:,.2f}\nTP2 (40%): ${tp2_price:,.2f}\nTP3 (30%): momentum exhaustion"
+               if tiered else f"TP: ${tp2_price:,.2f} (single — order too small to split)")
     send_telegram(
         f"{'✅' if side == 'Buy' else '🔻'} {direction} opened on {SYMBOL}\n"
-        f"Price: ${price:,.2f}\n"
-        f"Stop Loss: ${stop_loss:,.2f}\n"
-        f"Take Profit: ${take_profit:,.2f}"
+        f"Entry: ${price:,.2f} | Qty: {total_qty} BTC\n"
+        f"Stop Loss: ${stop_loss:,.2f}\n{tp_note}"
     )
 
 
@@ -558,32 +626,101 @@ def check_closed_positions():
         resp    = session.get_positions(category="linear", symbol=SYMBOL)
         current = {p["side"]: p for p in resp["result"]["list"] if float(p.get("size", 0)) > 0}
 
-        for side, pos_data in _open_positions.items():
+        for side, pos_data in list(_open_positions.items()):
+            entry_price  = pos_data.get("entry_price", 0)
+            original_qty = pos_data.get("original_qty", pos_data.get("size", 0))
+            close_side   = "Sell" if side == "Buy" else "Buy"
+
             if side not in current:
-                # Fetch closed PnL from Bybit
-                entry_price = pos_data.get("entry_price", 0)
-                qty         = pos_data.get("size", 0)
+                # Position fully closed — determine reason
                 try:
                     pnl_resp   = session.get_closed_pnl(category="linear", symbol=SYMBOL, limit=1)
                     pnl_record = pnl_resp["result"]["list"][0] if pnl_resp["result"]["list"] else {}
-                    exit_price  = float(pnl_record.get("avgExitPrice", 0))
-                    exit_reason = "take_profit" if float(pnl_record.get("closedPnl", 0)) > 0 else "stop_loss"
+                    exit_price = float(pnl_record.get("avgExitPrice", 0))
+                    closed_pnl = float(pnl_record.get("closedPnl", 0))
+                    if pos_data.get("tp2_hit"):
+                        exit_reason = "tp3"
+                    elif pos_data.get("tp1_hit"):
+                        exit_reason = "tp2"
+                    elif closed_pnl > 0:
+                        exit_reason = "tp1"
+                    else:
+                        exit_reason = "stop_loss"
                 except Exception:
                     exit_price  = 0
                     exit_reason = "unknown"
 
-                pnl_usdt, pnl_pct = log_trade_exit(SYMBOL, side, exit_price, exit_reason, entry_price, qty)
+                pnl_usdt, pnl_pct = log_trade_exit(SYMBOL, side, exit_price, exit_reason, entry_price, original_qty)
                 emoji = "🟢" if pnl_usdt >= 0 else "🔴"
                 send_telegram(
-                    f"🔔 {SYMBOL} {side} position closed\n"
-                    f"Exit: ${exit_price:,.2f} ({exit_reason.replace('_', ' ')})\n"
+                    f"🔔 {SYMBOL} {side} fully closed ({exit_reason.replace('_', ' ')})\n"
+                    f"Exit: ${exit_price:,.2f}\n"
                     f"{emoji} P&L: ${pnl_usdt:+.2f} ({pnl_pct:+.2f}%)"
                 )
+                del _open_positions[side]
+                continue
 
-        _open_positions.clear()
-        _open_positions.update({side: {"side": side, "entry_price": float(p.get("avgPrice", 0)),
-                                        "size": float(p.get("size", 0))}
-                                 for side, p in current.items()})
+            # Position still open — check tiered TP progress
+            if not pos_data.get("tiered"):
+                continue
+
+            current_size = float(current[side]["size"])
+
+            # TP1 hit: size fell to ~70% or below
+            if not pos_data["tp1_hit"] and current_size <= original_qty * 0.75:
+                pos_data["tp1_hit"] = True
+                try:
+                    session.set_trading_stop(
+                        category="linear", symbol=SYMBOL, positionIdx=0,
+                        stopLoss=str(entry_price), tpslMode="Full",
+                    )
+                    pos_data["be_moved"] = True
+                except Exception as e:
+                    logger.error("Failed to move SL to break-even: %s", e)
+                send_telegram(
+                    f"🎯 TP1 hit — {SYMBOL} {side}\n"
+                    f"30% closed near ${pos_data['tp1_price']:,.2f}\n"
+                    f"SL moved to break-even: ${entry_price:,.2f}\n"
+                    f"Watching TP2 at ${pos_data['tp2_price']:,.2f}"
+                )
+
+            # TP2 hit: size fell to ~30% or below
+            elif pos_data["tp1_hit"] and not pos_data["tp2_hit"] and current_size <= original_qty * 0.35:
+                pos_data["tp2_hit"] = True
+                send_telegram(
+                    f"🎯 TP2 hit — {SYMBOL} {side}\n"
+                    f"40% closed near ${pos_data['tp2_price']:,.2f}\n"
+                    f"Final 30% riding — watching for momentum exhaustion"
+                )
+
+            # TP3: momentum exhaustion check on remaining 30%
+            elif pos_data["tp2_hit"] and not pos_data["tp3_hit"]:
+                if check_momentum_exhaustion(side):
+                    try:
+                        session.place_order(
+                            category="linear", symbol=SYMBOL, side=close_side,
+                            orderType="Market", qty=str(current_size), reduceOnly=True,
+                        )
+                        pos_data["tp3_hit"] = True
+                        send_telegram(
+                            f"🎯 TP3 — Momentum Exhaustion — {SYMBOL} {side}\n"
+                            f"Final 30% closed at market\n"
+                            f"RSI overextended + volume climax confirmed"
+                        )
+                    except Exception as e:
+                        logger.error("TP3 market close failed: %s", e)
+
+        # Update size for still-open tracked positions; register any untracked ones
+        for side, p in current.items():
+            if side in _open_positions:
+                _open_positions[side]["size"] = float(p.get("size", 0))
+            else:
+                _open_positions[side] = {
+                    "side": side, "entry_price": float(p.get("avgPrice", 0)),
+                    "original_qty": float(p.get("size", 0)), "tiered": False,
+                    "tp1_hit": False, "tp2_hit": False, "tp3_hit": False, "be_moved": False,
+                }
+
     except Exception as e:
         logger.error("Position check error: %s", e)
 
