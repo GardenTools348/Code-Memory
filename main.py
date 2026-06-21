@@ -56,6 +56,11 @@ def init_db():
     if not DATABASE_URL:
         logger.warning("DATABASE_URL not set — trade journaling disabled.")
         return
+    import re
+    m = re.match(r'postgres(?:ql)?://([^:]+):(.+)@\[?([^\]/:]+)\]?:(\d+)/(.+)', DATABASE_URL)
+    if m:
+        user, _, host, port, database = m.groups()
+        logger.info("DB connect → user=%s host=%s port=%s db=%s", user, host, port, database.split("?")[0])
     try:
         with get_db() as conn:
             cur = conn.cursor()
