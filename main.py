@@ -123,8 +123,11 @@ def log_trade_exit(symbol: str, side: str, exit_price: float,
                 cur.execute("""
                     UPDATE trades SET exit_price=%s, exit_time=%s, exit_reason=%s,
                         pnl_usdt=%s, pnl_pct=%s
-                    WHERE symbol=%s AND side=%s AND exit_price IS NULL
-                    ORDER BY entry_time DESC LIMIT 1
+                    WHERE id = (
+                        SELECT id FROM trades
+                        WHERE symbol=%s AND side=%s AND exit_price IS NULL
+                        ORDER BY entry_time DESC LIMIT 1
+                    )
                 """, (exit_price, datetime.now(timezone.utc), exit_reason,
                       pnl_usdt, pnl_pct, symbol, side))
                 conn.commit()
