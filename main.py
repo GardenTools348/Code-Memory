@@ -498,7 +498,7 @@ def performance():
 
 
 @app.post("/test-long")
-async def test_long(request: Request):
+async def test_long(request: Request, force: bool = False):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {BOT_SECRET}":
         raise HTTPException(status_code=401, detail="invalid secret")
@@ -527,6 +527,11 @@ async def test_long(request: Request):
             "support":   round(support[-1], 2) if support else round(price * 0.985, 2),
         }
 
+        if force:
+            logger.info("Test long — force=true, bypassing Claude")
+            execute_trade("Buy", price, claude_reason="force-executed for testing")
+            return {"status": "executed", "claude": "bypassed (force=true)", "price": price}
+
         response = ask_claude("long", fake_signal)
         logger.info("Test long — Claude: %s", response)
 
@@ -543,7 +548,7 @@ async def test_long(request: Request):
 
 
 @app.post("/test-short")
-async def test_short(request: Request):
+async def test_short(request: Request, force: bool = False):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {BOT_SECRET}":
         raise HTTPException(status_code=401, detail="invalid secret")
@@ -572,6 +577,11 @@ async def test_short(request: Request):
             "resistance": round(resistance[-1], 2) if resistance else round(price * 1.02, 2),
         }
 
+        if force:
+            logger.info("Test short — force=true, bypassing Claude")
+            execute_trade("Sell", price, claude_reason="force-executed for testing")
+            return {"status": "executed", "claude": "bypassed (force=true)", "price": price}
+
         response = ask_claude("short", fake_signal)
         logger.info("Test short — Claude: %s", response)
 
@@ -599,24 +609,11 @@ async def execute(req: ExecuteRequest, request: Request):
     if not req.price:
         raise HTTPException(status_code=400, detail="price is required")
 
-    side        = "Buy" if req.action == "buy" else "Sell"
-    qty         = round(ORDER_QTY_USDT / req.price, 3)
-    stop_loss   = round(req.price * (1 - STOP_LOSS_PCT / 100) if side == "Buy" else req.price * (1 + STOP_LOSS_PCT / 100), 2)
-    take_profit = round(req.price * (1 + TAKE_PROFIT_PCT / 100) if side == "Buy" else req.price * (1 - TAKE_PROFIT_PCT / 100), 2)
+    side = "Buy" if req.action == "buy" else "Sell"
 
     try:
-        close_result = close_opposing_position(req.symbol, side)
-        result = session.place_order(
-            category="linear",
-            symbol=req.symbol,
-            side=side,
-            orderType="Market",
-            qty=str(qty),
-            stopLoss=str(stop_loss),
-            takeProfit=str(take_profit),
-        )
-        logger.info("Order result: %s", result)
-        return {"status": "executed", "order": result, "closed_position": close_result}
+        execute_trade(side, req.price, claude_reason=req.reason or "")
+        return {"status": "executed", "side": side, "price": req.price}
     except Exception as exc:
         logger.error("Order failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
